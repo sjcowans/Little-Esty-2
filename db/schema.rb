@@ -1,76 +1,125 @@
-# This file is auto-generated from the current state of the database. Instead
-# of editing this file, please use the migrations feature of Active Record to
-# incrementally modify your database, and then regenerate this schema definition.
-#
-# This file is the source Rails uses to define your schema when running `bin/rails
-# db:schema:load`. When creating a new database, `bin/rails db:schema:load` tends to
-# be faster and is potentially less error prone than running all of your
-# migrations from scratch. Old migrations may fail to apply correctly if those
-# migrations use external dependencies or application code.
-#
-# It's strongly recommended that you check this file into your version control system.
+require 'csv'
 
-ActiveRecord::Schema.define(version: 2025_01_15_013745) do
-
-  # These are extensions that must be enabled in order to support this database
-  enable_extension "plpgsql"
-
-  create_table "customers", force: :cascade do |t|
-    t.string "first_name"
-    t.string "last_name"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
+namespace :import do
+  task :all => :environment do
+    Rake::Task['import:customers'].invoke
+    Rake::Task['import:merchants'].invoke
+    Rake::Task['import:items'].invoke
+    Rake::Task['import:invoices'].invoke
+    Rake::Task['import:transactions'].invoke
+    Rake::Task['import:invoice_items'].invoke
   end
 
-  create_table "invoice_items", force: :cascade do |t|
-    t.bigint "invoice_id"
-    t.bigint "item_id"
-    t.integer "quantity"
-    t.decimal "unit_price"
-    t.integer "status"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
-    t.index ["invoice_id"], name: "index_invoice_items_on_invoice_id"
-    t.index ["item_id"], name: "index_invoice_items_on_item_id"
+  task :customers => :environment do
+    import_csv('db/data/customers.csv', Customer, 'log/customers_import.log')
   end
 
-  create_table "invoices", force: :cascade do |t|
-    t.integer "status"
-    t.bigint "customer_id"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
-    t.index ["customer_id"], name: "index_invoices_on_customer_id"
+  task :merchants => :environment do
+    import_csv('db/data/merchants.csv', Merchant, 'log/merchants_import.log')
   end
 
-  create_table "items", force: :cascade do |t|
-    t.string "name"
-    t.text "description"
-    t.decimal "unit_price"
-    t.bigint "merchant_id"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
-    t.index ["merchant_id"], name: "index_items_on_merchant_id"
+  task :items => :environment do
+    import_csv('db/data/items.csv', Item, 'log/items_import.log')
   end
 
-  create_table "merchants", force: :cascade do |t|
-    t.string "name"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
+  task :invoices => :environment do
+    import_csv('db/data/invoices.csv', Invoice, 'log/invoices_import.log') do |row|
+      {
+        id: row['id'],
+        customer_id: row['customer_id'],
+        status: map_status(row['status']),
+        created_at: row['created_at'],
+        updated_at: row['updated_at']
+      }
+    end
   end
 
-  create_table "transactions", force: :cascade do |t|
-    t.bigint "invoice_id"
-    t.integer "credit_card_number"
-    t.date "credit_card_expiration_date"
-    t.integer "result"
-    t.datetime "created_at", precision: 6, null: false
-    t.datetime "updated_at", precision: 6, null: false
-    t.index ["invoice_id"], name: "index_transactions_on_invoice_id"
+  task :transactions => :environment do
+    import_csv('db/data/transactions.csv', Transaction, 'log/transactions_import.log') do |row|
+      {
+        id: row['id'],
+        invoice_id: row['invoice_id'],
+        credit_card_number: row['credit_card_number'],
+        credit_card_expiration_date: parse_date(row['credit_card_expiration_date']),
+        result: map_status(row['result']),
+        created_at: row['created_at'],
+        updated_at: row['updated_at']
+      }
+    end
   end
 
-  add_foreign_key "invoice_items", "invoices"
-  add_foreign_key "invoice_items", "items"
-  add_foreign_key "invoices", "customers"
-  add_foreign_key "items", "merchants"
-  add_foreign_key "transactions", "invoices"
+  task :invoice_items => :environment do
+    import_csv('db/data/invoice_items.csv', InvoiceItem, 'log/invoice_items_import.log') do |row|
+      {
+        id: row['id'],
+        item_id: row['item_id'],
+        invoice_id: row['invoice_id'],
+        quantity: row['quantity'],
+        unit_price: row['unit_price'],
+        status: map_status(row['status']),
+        created_at: row['created_at'],
+        updated_at: row['updated_at']
+      }
+    end
+  end
+end
+
+def import_csv(file_path, model, log_file_path)
+  File.open(log_file_path, 'w') do |log_file|
+    invalid_count = 0
+    duplicate_count = 0
+    success_count = 0
+    total_count = 0
+
+    CSV.foreach(file_path, headers: true) do |row|
+      total_count += 1
+      attributes = block_given? ? yield(row) : row.to_hash
+
+      begin
+        record = model.find_or_initialize_by(id: attributes['id'])
+        attributes.except!('id') # Avoid reassigning the primary key
+        record.assign_attributes(attributes)
+
+        if record.save
+          success_count += 1
+          log_file.puts "SUCCESS: #{model.name} record ID #{attributes['id']} imported successfully."
+        else
+          invalid_count += 1
+          log_file.puts "INVALID: #{model.name} record ID #{attributes['id']} failed to import. Errors: #{record.errors.full_messages.join(', ')}"
+        end
+      rescue ActiveRecord::RecordNotUnique
+        duplicate_count += 1
+        log_file.puts "DUPLICATE: #{model.name} record ID #{attributes['id']} already exists. Skipping."
+      end
+    end
+
+    ActiveRecord::Base.connection.reset_pk_sequence!(model.table_name)
+    log_file.puts "\nSUMMARY for #{model.name.pluralize}:"
+    log_file.puts "Total Records Processed: #{total_count}"
+    log_file.puts "Successfully Imported: #{success_count}"
+    log_file.puts "Invalid Records: #{invalid_count}"
+    log_file.puts "Duplicate Records: #{duplicate_count}"
+  end
+
+  puts "#{model.name.pluralize} import completed. Check the log file at #{log_file_path} for details."
+end
+
+def map_status(status)
+  case status
+  when 'cancelled', 'failed', 'pending' then 3
+  when 'in progress', 'packaged' then 2
+  when 'completed', 'success', 'shipped' then 1
+  else status
+  end
+end
+
+def parse_date(date_string)
+  return nil if date_string.blank?
+
+  begin
+    Date.parse(date_string)
+  rescue ArgumentError
+    puts "Invalid date format: #{date_string}. Returning nil."
+    nil
+  end
 end
